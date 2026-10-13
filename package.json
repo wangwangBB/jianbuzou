@@ -1,0 +1,15 @@
+{
+  "name": "walk-qr-cloudflare-pages",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "健步走签到、打点、答题、签退系统，Cloudflare Pages + Pages Functions + D1 版本（无 npm 二维码依赖版）",
+  "scripts": {
+    "deploy": "wrangler pages deploy public --project-name walk-qr-cloudflare-pages",
+    "dev": "wrangler pages dev public --compatibility-date=2025-01-01"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "wrangler": "^4.20.0"
+  }
+}
