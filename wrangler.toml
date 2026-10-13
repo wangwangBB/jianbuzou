@@ -5,4 +5,4 @@ pages_build_output_dir = "public"
 [[d1_databases]]
 binding = "DB"
 database_name = "walk_qr_db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "19cdf094-ef3f-4731-8ed5-18286300e315"
