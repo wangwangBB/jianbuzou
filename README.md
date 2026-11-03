@@ -1,469 +1,192 @@
-# 健步走签到打点系统（Cloudflare Pages 版）
+# 健步走签到打点系统 · 独立点位扫码版 v2.0
 
-这是一个部署在 Cloudflare Pages 上的健步走签到、打点、答题、签退系统。
+基于原 `walk-qr-cloudflare-pages-no-password-link.zip` 修改，仍使用 **Cloudflare Pages + Pages Functions + D1**。这是可部署源码包，部署构建时安装二维码依赖；不是可直接拖到 Pages 的纯静态网页包。
 
-技术结构：
+## 本次变化
 
-- Cloudflare Pages：提供 `*.pages.dev` 访问地址和 GitHub 自动部署。
-- Pages Functions：处理后台登录、扫码、签到、答题、签退、导出 CSV 等动态逻辑。
-- Cloudflare D1：保存选手、题库、打点和答题记录。
+- 签到成功直接显示三个独立点位卡片；同一浏览器访问 `/me` 可回到点位页。
+- 点击卡片申请摄像头权限，优先使用后置摄像头。**点击、打开摄像头、识别二维码本身都不会新增打点记录**。
+- 服务端验证二维码签名、有效期、所属点位与选手身份，通过后进入本点位随机答题；提交答案后才算完成打点。
+- 二维码默认有效 **45 秒**，现场屏幕约每 **20 秒**刷新；有效期可配置为 15～120 秒整数，刷新间隔自动调整。
+- 重复或并发提交不能新增第二条点位记录，也不会覆盖首次答案。
+- 本站服务端生成二维码，扫码脚本由构建步骤复制到本站；活动时不使用外部二维码生成服务或脚本 CDN。
+- 不增加点位密码、专属链接密钥或 `QR_KEY_CP1` 等变量。现场展示与发码接口继续沿用原项目的管理员登录保护。
 
-> 说明：纯静态 Pages 不能安全地保存签到和答题数据，所以本项目使用 Pages Functions。它仍然是 Pages 项目，访问地址是 `pages.dev`，不是 `workers.dev`。
+## 原功能保留
 
----
+姓名、手机号、原有 15 个部门下拉选项、签到前个人信息确认；随机题库与答题记录；任意一个点位完成后回起点扫码签退；后台统计、详情、单个选手删除、清空选手数据（保留题库）、题库增删；CSV 每名选手一行，包含手机号及三个点位完成信息；同浏览器 Cookie 保持身份及清除本机信息入口。
 
-## 一、功能说明
+按原规则，提交有效选项即记录该点位，答错也记录；签退后才算完成比赛。
 
-### 选手端
+## 已有项目升级
 
-1. 起点扫码签到，填写姓名和部门。
-2. 到点位一、点位二、点位三扫码。
-3. 每个点位扫码后随机抽取一道题，手机答题。
-4. 后台记录选手点位、题目、选择答案、正确答案、是否正确、提交时间。
-5. 完成任意一个点位后，回到起点扫码签退。
-6. 签退后才算完成比赛。
+1. 备份现有项目和 D1 数据，记下当前 `wrangler.toml` 的真实 `database_id`。
+2. 将 ZIP 中 `walk-qr-cloudflare-pages/` **里面的文件**覆盖到仓库根目录。必须同步更新 `functions/`、`lib/`、`public/`、`scripts/`、`package.json`，不能只替换 `_app.js`。
+3. **保留自己的 `wrangler.toml`，不要把数据库 ID 覆盖成 ZIP 的占位符。** 上传原包没有真实 ID，只有 `REPLACE_WITH_YOUR_D1_DATABASE_ID`。
+4. Cloudflare Pages 构建配置改为下表；核对 `DB` 绑定仍指向原数据库。
+5. 核对环境变量和 Secret，重新部署，刷新所有工作人员二维码屏幕。
+6. **本次没有数据库结构变更**，已有 `phone` 字段的数据库无需迁移。不要清库或重新执行 `seed.sql`；重复导入种子文件会产生重复题目。
+7. 在活动开始前升级。旧版二维码及旧答题页面将失效，需要重新扫描；若保持 `QR_SECRET` 不变，原有选手 Cookie 可继续使用。更换密钥则所有选手和管理员会话都失效。
 
-### 后台端
+| 构建项目 | 值 |
+| --- | --- |
+| Framework preset | None |
+| Build command | `npm install && npm run build` |
+| Build output directory | `public` |
+| Root directory | 留空，表示仓库根目录 |
+| 环境变量 `NODE_VERSION` | `24` |
 
-访问：
+**旧版“构建可留空、无需 npm 二维码依赖”的说明不适用于本版。** 新版固定使用 `jsqr@1.4.0`、`qrcode-generator@1.4.4`；缺少依赖时构建会报错，避免发布没有扫码组件的页面。
 
-```txt
-https://你的项目.pages.dev/admin
-```
+## 首次部署
 
-后台功能：
-
-- 查看已签到、进行中、已完成统计。
-- 查看选手列表。
-- 查看选手详情和答题记录。
-- 导出 CSV：每名选手只占一行，导出姓名、部门、签到/签退状态和完成点位信息。
-- 打开起点和三个点位的动态二维码。
-- 管理题库。
-
----
-
-## 二、项目文件说明
-
-```txt
-walk-qr-cloudflare-pages/
-├─ functions/
-│  ├─ _app.js          # 核心后台、扫码、答题逻辑
-│  ├─ index.js         # 首页路由
-│  └─ [[path]].js      # 全路径兜底路由，负责 /admin、/scan 等
-├─ public/
-│  ├─ index.html       # 静态入口，自动跳转 /admin
-│  ├─ _routes.json     # 让所有路径经过 Pages Functions
-│  └─ _headers         # 基础安全响应头
-├─ schema.sql          # 数据库表结构
-├─ seed.sql            # 示例题库
-├─ wrangler.toml       # Pages + D1 配置
-├─ package.json        # 依赖配置
-└─ README.md
-```
-
----
-
-## 三、部署方式：GitHub + Cloudflare Pages
-
-### 1. 上传到 GitHub
-
-1. 在 GitHub 新建仓库，例如：
-
-```txt
-walk-qr-cloudflare-pages
-```
-
-2. 解压本项目 ZIP。
-3. 把项目内所有文件上传到 GitHub 仓库根目录。
-
-注意：`functions`、`public`、`schema.sql`、`seed.sql`、`wrangler.toml` 必须在仓库根目录。
-
----
-
-### 2. 创建 D1 数据库
-
-Cloudflare 后台：
-
-```txt
-Workers & Pages → D1 SQL Database → Create database
-```
-
-数据库名称建议：
-
-```txt
-walk_qr_db
-```
-
-创建后复制 `database_id`。
-
-打开 GitHub 仓库里的 `wrangler.toml`，把：
+1. 创建 GitHub 仓库，将项目目录内文件放到仓库根目录，`functions/` 与 `public/` 同级。
+2. 创建 Cloudflare D1 数据库（建议名 `walk_qr_db`），填入 `wrangler.toml` 的真实 `database_id`。
+3. 仅新库先执行 `schema.sql`，再执行一次 `seed.sql`。
+4. 创建 **Pages** 项目并连接 Git，采用上方构建配置。不要只上传 `public/`，否则不会部署业务 Functions。
+5. 配置 D1 binding `DB` 和下列环境变量，重新部署。预览环境建议使用独立测试数据库。
+6. 访问 `https://你的项目.pages.dev/admin` 登录。
 
 ```toml
-REPLACE_WITH_YOUR_D1_DATABASE_ID
-```
+name = "walk-qr-cloudflare-pages"
+compatibility_date = "2025-01-01"
+pages_build_output_dir = "public"
 
-替换成你的真实 `database_id`。
-
-最终类似：
-
-```toml
 [[d1_databases]]
 binding = "DB"
 database_name = "walk_qr_db"
-database_id = "8f3a1c2d-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+database_id = "你的真实数据库ID"
 ```
 
----
+很早版本数据库若缺手机号列，先用 `PRAGMA table_info(participants);` 确认，仅在缺列时执行 `migration_add_phone.sql`。仍保留原版自动补 `phone` 列逻辑。
 
-### 3. 初始化数据库表
+## 环境变量
 
-进入 Cloudflare 的 D1 数据库页面，找到 Console / Query 控制台。
+| 名称 | 用途 |
+| --- | --- |
+| `ADMIN_PASSWORD` | 必填，独立后台密码；不能使用旧公开默认值 `admin123456`。没有点位单独密码。 |
+| `QR_SECRET` | 必填，至少 32 位随机密钥；不能使用示例占位符。签名二维码及会话。 |
+| `EVENT_TITLE` | 可选，活动名称。 |
+| `QR_TOKEN_TTL_SECONDS` | 默认 `45`，仅接受 15～120 的整数，其余回退为 45。 |
+| `ACTION_TOKEN_TTL_SECONDS` | 默认 `600`，仅接受 120～900 的整数，控制签到确认、答题、签退确认时限。 |
+| `NODE_VERSION` | 构建环境建议 `24`。 |
 
-先复制并执行 `schema.sql`。
+将后台密码和签名密钥保存为 Pages Secret。缺少安全配置时系统显示配置提示，不再采用公开默认密码和密钥。生成随机密钥示例：
 
-执行后如果提示“此查询未返回数据”，是正常的，因为建表语句本来不返回查询结果。
-
-然后复制并执行 `seed.sql`，导入示例题库。
-
-检查题库是否导入：
-
-```sql
-SELECT COUNT(*) AS total FROM questions;
+```sh
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-返回大于 0 即可。
+不要提交真实 Secret 到 Git。`.dev.vars.example` 仅作格式示例，本地复制成 `.dev.vars` 后填自己的值。
 
----
+## 现场使用
 
-### 4. 创建 Cloudflare Pages 项目
+工作人员四个屏幕分别登录后台后，打开以下独立页面，每页只展示对应点位码：
 
-Cloudflare 后台：
+| 位置 | 路径 |
+| --- | --- |
+| 起点 | `/display/start` |
+| 点位一 | `/display/cp1` |
+| 点位二 | `/display/cp2` |
+| 点位三 | `/display/cp3` |
 
-```txt
-Workers & Pages → Create application → Pages → Connect to Git
+不要在选手设备登录管理员账号，不要把后台四码汇总页面当作现场打点屏幕。保持屏幕联网和常亮；刷新失败时旧码到期会隐藏。
+
+选手流程：
+
+1. 起点扫码，填写姓名、手机号、选择部门，核对后确认签到。
+2. 成功页直接出现三个卡片，无需退出或重新登录。
+3. 到达某点位，点击对应卡片，允许摄像头权限，对准该点位现场屏幕。
+4. 验证通过后答题，默认 10 分钟内提交。只有提交后才完成点位。已通过扫码验证且仍在答题时限内时，展示码随后过期不会中断答题。
+5. 任意一点位完成后回起点，点击“扫描起点二维码，办理签退”，扫描现场码，再确认签退。
+6. 签退后不能继续打点。
+
+也保留外部扫一扫直接打开有效现场码的兼容路径，仍须相同的服务端签名、有效期、身份及重复校验。请始终使用签到时的同一浏览器；换浏览器可能识别不到 Cookie。
+
+## 防作弊校验及边界
+
+- **点位绑定**：签名包含 `start/cp1/cp2/cp3` 点位码、版本、签发/到期时间及随机值；篡改点位或到期时间会导致验签失败。
+- **独立入口**：卡片所选点位必须等于签名码中的点位。点位一入口扫描点位二、三或起点码会被拒绝。仅访问 `?point=cp1`、按钮或无签名链接无法取得答题授权。
+- **短时有效**：以服务器时间为准，到达过期秒即失效。展示屏及发码接口要求工作人员登录，选手不能自行获取新码。
+- **答题绑定**：扫码通过才签发短时答题凭证，绑定当前选手、点位和题目，不能借用其他选手凭证提交。
+- **防重复**：数据库 `UNIQUE(participant_id, point_code)` 加原子写入防止并发重复；插入时再次确认选手未签退、未删除、题目仍可用。
+- **回起点签退**：点位页不直接发签退凭证，须重新扫描有效起点码，并至少完成一个点位。
+
+**无法保证完全杜绝作弊。** 现场多人需要扫描同一个有效码，所以码不是全局一次性；重复限制针对同一选手的同一点位。短时二维码无法阻止有效期内的实时转发、视频共享、代扫或冒用身份，网页请求也不能证明真实地理位置。本版未添加 GPS、人脸、短信验证或到场硬件。工作人员应看管展示屏，不公开实时码和后台权限。
+
+手机号仍为登记字段，不是短信认证；沿用原来的姓名、手机号、部门匹配进行中签到记录的逻辑，不引入新实名或设备绑定规则。
+
+## 摄像头及常见问题
+
+- 使用 Pages 的 HTTPS 地址。首次会弹系统权限提示，不能绕过。
+- 真机验收 iPhone、安卓及实际使用的微信内置浏览器；部分内置浏览器可能不允许网页摄像头，不能保证所有微信版本可用。
+- 若需改用系统浏览器，应从起点开始在该浏览器建立签到身份，避免微信签到、其他浏览器打点。
+- 只提供实时摄像头扫码，没有相册上传或粘贴码入口。关闭、切后台和离开页面会释放摄像头。
+- “扫码组件未加载”：检查构建日志及 `/assets/jsQR.js`，不要漏传 `public/_routes.json` 或跳过构建。
+- “点位不匹配”：返回点位页选择实际所在点位，扫描相应屏幕。
+- “二维码已过期或无效”：扫描现场最新码；升级后刷新全部展示屏。
+- “请完成部署配置”：设置独立后台密码与至少 32 位随机密钥，重新部署。
+- “Could not resolve qrcode-generator”：检查 `package.json` 是否上传，构建是否安装依赖；新版不再使用外部生成接口兜底。
+
+## 文件及依赖
+
+```text
+functions/_app.js             业务路由、页面、D1 和校验
+functions/index.js            Pages 首页入口
+functions/[[path]].js         Pages 其他路由入口
+lib/qr.js                     本站生成 SVG 二维码（不作为公开路由）
+public/assets/scanner.js      摄像头、识别提交、权限及关闭处理
+public/assets/qr-display.js   展示码刷新及到期隐藏
+public/assets/jsQR.js         构建生成，不包含在源码 ZIP 中
+public/_routes.json           /assets/* 为静态路径，其余进 Functions
+scripts/build.mjs             复制固定版本 jsQR 到静态目录
+tests/                        业务、并发、摄像头逻辑和二维码集成测试
+schema.sql                    与原包一致，本次无需迁移
+seed.sql                      新库示例题库，仅执行一次
+migration_add_phone.sql       很早版本的可选手机号迁移
+wrangler.toml                 需填真实 D1 ID
+package.json
+.dev.vars.example
 ```
 
-选择你的 GitHub 仓库。
+二维码依赖使用 MIT 许可证，见 `THIRD_PARTY.md`。原始许可证随 npm 包提供。
 
-构建配置建议：
+## 本地运行及测试
 
-```txt
-Framework preset: None
-Build command: npm install
-Build output directory: public
-Root directory: /
+建议 Node.js 24。业务测试使用内置 SQLite 执行真实 SQL，并适配 D1 接口；不访问真实活动数据库。
+
+```sh
+# 不依赖 npm 下载的业务与摄像头控制逻辑测试
+npm test
+
+# 在允许下载依赖的环境中执行
+npm install
+npm run build
+npm run test:qr
+
+# 本地调试；先填写 .dev.vars
+npx wrangler d1 execute walk_qr_db --local --file=schema.sql
+npx wrangler d1 execute walk_qr_db --local --file=seed.sql
+npm run dev
+
+# 本地部署；须先 wrangler 登录及填写数据库 ID
+npm run deploy
 ```
 
-然后点击部署。
-
----
-
-### 5. 绑定 D1 数据库到 Pages Functions
-
-如果你已经在 `wrangler.toml` 中正确填写 D1，部分情况下 Cloudflare 会自动识别。
-
-如果后台访问时提示 `DB` 未绑定，请手动绑定：
-
-```txt
-Pages 项目 → Settings → Bindings → Add binding → D1 database
-```
-
-填写：
-
-```txt
-Variable name: DB
-D1 database: walk_qr_db
-```
-
-生产环境和预览环境建议都绑定一次。
-
----
-
-### 6. 设置环境变量 / Secret
-
-进入 Pages 项目：
-
-```txt
-Settings → Environment variables
-```
-
-添加生产环境变量：
-
-```txt
-ADMIN_PASSWORD = 你的后台密码
-QR_SECRET = 一串长随机密钥
-EVENT_TITLE = 健步走签到打点系统
-QR_KEY_START = 起点二维码专属链接密钥
-QR_KEY_CP1 = 点位一二维码专属链接密钥
-QR_KEY_CP2 = 点位二二维码专属链接密钥
-QR_KEY_CP3 = 点位三二维码专属链接密钥
-```
-
-示例：
-
-```txt
-ADMIN_PASSWORD = bjdc!001
-QR_SECRET = walk_qr_secret_2026_TJGN_9xKp72LmQ4vR
-EVENT_TITLE = 2026年安全生产月健步走活动
-QR_KEY_START = Start_2026_x9A
-QR_KEY_CP1 = CP1_2026_p7K
-QR_KEY_CP2 = CP2_2026_m8Q
-QR_KEY_CP3 = CP3_2026_z5T
-```
-
-注意：
-
-- `ADMIN_PASSWORD` 是后台登录密码。
-- `QR_SECRET` 是动态二维码签名密钥，不能太简单。
-- `QR_KEY_START`、`QR_KEY_CP1`、`QR_KEY_CP2`、`QR_KEY_CP3` 是各二维码展示页的专属链接密钥。后台会自动生成带 `?k=` 的链接，分别发给起点和三个点位工作人员使用。
-- 改完环境变量后建议重新部署一次。
-
----
-
-## 四、使用方式
-
-部署成功后访问：
-
-```txt
-https://你的项目.pages.dev/admin
-```
-
-登录后台后，进入：
-
-```txt
-动态二维码
-```
-
-分别打开：
-
-- 起点签到 / 签退二维码
-- 点位一二维码
-- 点位二二维码
-- 点位三二维码
-
-现场可以用四台电脑、四个平板或四部手机分别显示四个二维码。
-
-二维码会自动刷新。选手扫码后，后台会判断当前二维码是否有效。
-
----
-
-## 五、点位规则
-
-系统默认三个点位：
-
-```txt
-cp1 = 点位一
-cp2 = 点位二
-cp3 = 点位三
-```
-
-规则：
-
-- 必须先在起点签到。
-- 每个点位只能成功记录一次。
-- 每个点位必须完成答题后才算该点位完成。
-- 完成任意一个点位后，起点扫码页面就会显示“确认签退”。
-- 签退后，状态变为“已完成”。
-
----
-
-## 六、题库说明
-
-题库表支持：
-
-```txt
-ALL：通用题，三个点位都可能抽到
-cp1：仅点位一抽取
-cp2：仅点位二抽取
-cp3：仅点位三抽取
-```
-
-后台可以新增和删除题目。
-
-也可以直接在 D1 控制台插入题目，例如：
-
-```sql
-INSERT INTO questions
-(point_code, title, option_a, option_b, option_c, option_d, correct_option, explanation, enabled, created_at)
-VALUES
-('ALL', '安全生产方针是什么？', '安全第一、预防为主、综合治理', '效率第一', '成本优先', '只重生产', 'A', '', 1, datetime('now'));
-```
-
----
-
-## 七、常见问题
-
-### 1. `/admin` 还是 404？
-
-检查这些项目文件是否存在：
-
-```txt
-functions/[[path]].js
-functions/index.js
-functions/_app.js
-public/_routes.json
-```
-
-并确认你创建的是 Cloudflare Pages 项目，不是只上传了静态文件。
-
-### 2. 提示 DB 未绑定？
-
-到 Pages 项目设置里手动添加 D1 binding：
-
-```txt
-Variable name: DB
-Database: walk_qr_db
-```
-
-### 3. 登录密码是什么？
-
-如果没有设置 `ADMIN_PASSWORD`，系统临时默认密码是：
-
-```txt
-admin123456
-```
-
-正式活动前必须在 Pages 环境变量中设置自己的后台密码。
-
-### 4. QR_SECRET 可以随便填吗？
-
-可以自己填，但必须足够长、随机、复杂。不要用 `123456`、`admin`、单位拼音等简单内容。
-
-
-### 点位二维码页面专属链接密钥
-
-为了防止不同点位工作人员互相打开或代开二维码，系统支持为每个二维码展示页设置专属链接密钥：
-
-```txt
-QR_KEY_START = 起点二维码专属链接密钥
-QR_KEY_CP1 = 点位一二维码专属链接密钥
-QR_KEY_CP2 = 点位二二维码专属链接密钥
-QR_KEY_CP3 = 点位三二维码专属链接密钥
-```
-
-设置后，后台“动态二维码”页面会生成类似下面的工作人员专属链接：
-
-```txt
-/display/cp1?k=CP1_2026_p7K
-```
-
-把对应链接发给对应点位工作人员即可，工作人员不需要输入密码。没有正确 `k=` 密钥时，普通工作人员无法打开该点位二维码页面。后台管理员登录后仍可从“动态二维码”页面统一查看和打开。
-
-如果某个点位密钥未设置，该点位二维码展示页将只允许后台管理员打开；普通工作人员打开时会提示先配置对应环境变量。
-
-### 5. 选手换手机后怎么办？
-
-当前系统通过手机 Cookie 识别选手。如果选手换手机，需要重新起点签到；或者由后台工作人员核对记录。
-
-### 6. 一个手机多人使用怎么办？
-
-手机端有“清除本机签到信息”入口。清除后可重新给另一名选手签到。
-
----
-
-## 八、相较 Worker 版的变化
-
-保留：
-
-- 后台管理
-- D1 数据库记录
-- 动态二维码
-- 起点签到
-- 三个点位扫码答题，完成任意一个点位即可签退
-- 起点签退
-- CSV 导出：每名选手一行，不导出题目信息，只导出完成点位信息
-
-变化：
-
-- 项目部署为 Cloudflare Pages。
-- 访问地址使用 `pages.dev`。
-- 动态逻辑通过 Pages Functions 实现。
-- 不再使用 `workers.dev` 默认地址。
-
----
-
-## 九、正式活动前测试清单
-
-1. 用不挂代理的手机访问 `/admin`。
-2. 后台登录是否正常。
-3. D1 题库数量是否大于 0。
-4. 起点二维码扫码是否能签到。
-5. 点位一、点位二、点位三是否能随机抽题。
-6. 未完成任何点位前是否无法签退。
-7. 完成任意一个点位后是否可以签退。
-8. 后台记录是否完整。
-9. CSV 导出是否正常。
-10. 用移动、联通、电信网络分别测试访问速度。
-
-
-## 构建报错 `Could not resolve "qrcode"` 的说明
-
-本版本已经去掉 `qrcode` 这个 npm 依赖，二维码由 Pages Function 生成短时签名链接后调用在线二维码接口返回图片。
-因此 Cloudflare Pages 日志中即使显示 `No build command specified. Skipping build step.` 也可以正常构建 Functions。
-
-如果你使用的是旧版本代码，看到如下报错：
-
-```txt
-Could not resolve "qrcode"
-```
-
-请更新到本版本，或删除旧代码第一行的 `import QRCode from "qrcode";` 并替换 `/api/qrcode.svg` 的生成逻辑。
-
-## 本版本新增功能
-
-### 1. 签到增加手机号
-
-选手在起点扫码签到时需要填写：
-
-- 姓名
-- 手机号
-- 部门
-
-手机号会写入 `participants.phone` 字段，并在后台列表、选手详情和 CSV 导出中显示。
-
-### 2. 部门改为下拉菜单
-
-签到页面不再手动输入部门，而是从以下规范部门中选择：
-
-- 公司领导
-- 党群与综合部
-- 人力资源部
-- 市场营销与经营管理部
-- 新能源部（业务发展部）
-- 财务部
-- 采购与合同管理部
-- 生产技术部
-- 安健环管理部
-- 发电运行部
-- 设备维护部
-- 海水淡化部
-- 燃料管理部
-- 北疆环科
-- 北疆能源销售
-
-### 3. 签到前增加个人信息确认
-
-起点扫码后，选手先填写信息；点击下一步后进入“确认个人信息”页面。选手确认姓名、手机号和部门无误后，才会正式写入数据库并完成签到。
-
-### 4. 后台可直接删除选手数据
-
-后台记录列表新增：
-
-- 单个选手删除按钮：删除该选手的签到、点位、答题和签退记录。
-- 清空选手数据按钮：删除全部选手记录，但不会删除题库。
-
-### 5. 数据库字段变更
-
-新版 `schema.sql` 已包含手机号字段：
-
-```sql
-phone TEXT NOT NULL DEFAULT ''
-```
-
-如果你是旧数据库升级，建议在 Cloudflare D1 Console 执行：
-
-```sql
-ALTER TABLE participants ADD COLUMN phone TEXT NOT NULL DEFAULT '';
-```
-
-本项目代码也加入了自动补字段逻辑，访问系统时会尝试自动为旧数据库添加 `phone` 字段；手动执行迁移更稳。
+`npm install` 会生成锁文件，验证后可一并提交。正式题库请在后台调整。
+
+## 交付验证与上线验收
+
+已通过 **36 项本地自动测试**，详见 `TEST_REPORT.md`。2026-11-03 已补做依赖安装、构建及 2 项二维码集成测试，全部通过。真实 D1 联调和真机扫码仍待完成；模拟摄像头测试不等于真机验收。
+
+- [ ] Pages 构建通过，D1 绑定正确，安全配置生效，`/assets/jsQR.js` 可加载。
+- [ ] 安装依赖后 `npm run test:qr` 通过；四个现场码均可生成、刷新并被手机识别。
+- [ ] 签到含手机号、部门下拉、信息确认，成功后直接出现三个卡片。
+- [ ] 点卡片仅开摄像头，取消不会新增记录。
+- [ ] 跨点位、起点混用、过期截图及篡改链接均被拒绝。
+- [ ] 扫码未答题仍未完成，答题新增一条；重复提交不增加，超时需重扫。
+- [ ] 零点位不能签退；任意一点位完成后回起点扫码可签退；签退后不能再打点。
+- [ ] CSV 每人一行、手机号正确；删除和清空功能正常且保留题库。
+- [ ] 真机检查权限拒绝、关闭和重新打开、切后台；展示屏断网后隐藏过期码。
+
+参考：[Pages 路由](https://developers.cloudflare.com/pages/functions/routing/)、[D1 语句](https://developers.cloudflare.com/d1/worker-api/prepared-statements/)、[摄像头 API](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)、[jsQR](https://github.com/cozmo/jsQR)、[二维码生成器](https://github.com/kazuhikoarase/qrcode-generator)。
