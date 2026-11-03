@@ -31,7 +31,7 @@ export async function handleRequest(request, env) {
     // All dynamic responses are private, including redirects and CSV exports.
     const response = await router(request, env);
     response.headers.set("Cache-Control", "no-store, private");
-    response.headers.set("Referrer-Policy", "no-referrer");
+    response.headers.set("Referrer-Policy", "strict-origin");
     response.headers.set("X-Content-Type-Options", "nosniff");
     response.headers.set("X-Frame-Options", "DENY");
     response.headers.set("Permissions-Policy", "camera=(self), microphone=()");
@@ -51,9 +51,14 @@ async function router(request, env) {
       /^(dev-secret|change_me|REPLACE_)/i.test(env.QR_SECRET)) {
     return htmlPage("请完成部署配置", `<div class="card warning"><h2>请完成部署配置</h2><p>请工作人员设置独立的 ADMIN_PASSWORD 和至少 32 位随机 QR_SECRET，然后重新部署。系统不会使用公开的默认密码或密钥。</p></div>`, 503, env);
   }
+  const postOrigin = request.headers.get("Origin");
+  const fetchSite = request.headers.get("Sec-Fetch-Site");
+  // Older pages used no-referrer, which can make browser form POST Origin null.
+  // Accept that case only with browser-provided same-origin Fetch Metadata.
+  const legacySameOrigin = postOrigin === "null" && fetchSite === "same-origin";
   if (request.method === "POST" && (
-    (request.headers.has("Origin") && request.headers.get("Origin") !== url.origin) ||
-    request.headers.get("Sec-Fetch-Site") === "cross-site"
+    (postOrigin && postOrigin !== url.origin && !legacySameOrigin) ||
+    fetchSite === "cross-site"
   )) return htmlPage("请求来源无效", `<div class="card warning">请在本站重新打开页面操作。</div>`, 403, env);
 
   await ensureParticipantPhoneColumn(env);
@@ -917,7 +922,7 @@ function htmlPage(title, body, status = 200, env = {}, headers = {}, displayMode
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      "Referrer-Policy": "no-referrer",
+      "Referrer-Policy": "strict-origin",
       ...headers
     }
   });
