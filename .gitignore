@@ -1,0 +1,7 @@
+node_modules
+.wrangler
+.DS_Store
+.dev.vars
+
+public/assets/jsQR.js
+public/assets/jsQR.LICENSE.txt

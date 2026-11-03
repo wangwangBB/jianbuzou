@@ -1,3 +1,5 @@
+import { renderQrSvg } from "../lib/qr.js";
+
 const POINTS = {
   start: { code: "start", label: "起点签到 / 签退", short: "起点" },
   cp1: { code: "cp1", label: "一号打点点位", short: "点位一" },
@@ -23,21 +25,36 @@ const DEPARTMENTS = [
   "北疆能源销售"
 ];
 let phoneColumnReady = false;
-const DEFAULT_ADMIN_PASSWORD = "admin123456";
-const DEFAULT_QR_SECRET = "dev-secret-change-me";
 
 export async function handleRequest(request, env) {
   try {
-    return await router(request, env);
+    // All dynamic responses are private, including redirects and CSV exports.
+    const response = await router(request, env);
+    response.headers.set("Cache-Control", "no-store, private");
+    response.headers.set("Referrer-Policy", "no-referrer");
+    response.headers.set("X-Content-Type-Options", "nosniff");
+    response.headers.set("X-Frame-Options", "DENY");
+    response.headers.set("Permissions-Policy", "camera=(self), microphone=()");
+    return response;
   } catch (err) {
     console.error(err);
-    return htmlPage("系统错误", `<div class="card danger"><h2>系统错误</h2><p>${escapeHtml(err?.message || String(err))}</p></div>`, 500, env);
+    return htmlPage("系统错误", `<div class="card danger"><h2>系统错误</h2><p>服务暂时不可用，请稍后重试或联系工作人员。</p></div>`, 500, env);
   }
 }
 
 async function router(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
+
+  if (!env.ADMIN_PASSWORD || env.ADMIN_PASSWORD === "admin123456" ||
+      !env.QR_SECRET || env.QR_SECRET.length < 32 ||
+      /^(dev-secret|change_me|REPLACE_)/i.test(env.QR_SECRET)) {
+    return htmlPage("请完成部署配置", `<div class="card warning"><h2>请完成部署配置</h2><p>请工作人员设置独立的 ADMIN_PASSWORD 和至少 32 位随机 QR_SECRET，然后重新部署。系统不会使用公开的默认密码或密钥。</p></div>`, 503, env);
+  }
+  if (request.method === "POST" && (
+    (request.headers.has("Origin") && request.headers.get("Origin") !== url.origin) ||
+    request.headers.get("Sec-Fetch-Site") === "cross-site"
+  )) return htmlPage("请求来源无效", `<div class="card warning">请在本站重新打开页面操作。</div>`, 403, env);
 
   await ensureParticipantPhoneColumn(env);
 
@@ -49,15 +66,11 @@ async function router(request, env) {
   if (path === "/admin/login" && request.method === "POST") return adminLoginPost(request, env);
   if (path === "/admin/logout") return adminLogout(request, env);
 
-  if (path.startsWith("/admin")) {
+  if (path.startsWith("/admin") || path.startsWith("/display") || path === "/api/qrcode.svg") {
     if (!(await isAdmin(request, env))) {
+      if (path === "/api/qrcode.svg") return new Response("Unauthorized", { status: 401 });
       return redirect(`/admin/login?next=${encodeURIComponent(path + url.search)}`);
     }
-  }
-
-  if (path === "/api/qrcode.svg") {
-    const point = url.searchParams.get("point") || "";
-    if (!(await canViewQr(request, env, point))) return new Response("Unauthorized", { status: 401 });
   }
 
   if (path === "/admin" && request.method === "GET") return adminDashboard(request, env);
@@ -72,6 +85,8 @@ async function router(request, env) {
   if (path === "/admin/participants/clear" && request.method === "POST") return adminParticipantsClear(request, env);
   if (path === "/admin/export.csv" && request.method === "GET") return adminExportCsv(request, env);
 
+  if (path === "/me" && request.method === "GET") return participantHome(request, env);
+  if (path === "/scan/verify" && request.method === "POST") return verifyScannedPoint(request, env);
   if (path === "/scan" && request.method === "GET") return scan(request, env);
   if (path === "/checkin" && request.method === "POST") return checkinPost(request, env);
   if (path === "/checkin/confirm" && request.method === "POST") return checkinConfirmPost(request, env);
@@ -84,11 +99,64 @@ async function router(request, env) {
 async function scan(request, env) {
   const url = new URL(request.url);
   const token = url.searchParams.get("token") || "";
-  const qr = await verifyToken(token, secret(env));
-  if (!qr || qr.kind !== "qr" || !POINTS[qr.point]) return expiredPage(env);
+  const qr = await verifyQrToken(token, env);
+  if (!qr) return expiredPage(env);
 
   if (qr.point === "start") return startScanPage(request, env);
-  return checkpointScanPage(request, env, qr.point);
+  return checkpointScanPage(request, env, qr.point, qr);
+}
+
+async function verifyScannedPoint(request, env) {
+  const form = await request.formData();
+  const expected = String(form.get("expected_point") || "");
+  if (!Object.hasOwn(POINTS, expected)) return expiredPage(env);
+  const qr = await verifyQrToken(String(form.get("token") || ""), env);
+  if (!qr) return expiredPage(env);
+  // Never trust the card, the browser's decoder or a plain point parameter.
+  if (qr.point !== expected) {
+    return htmlPage("点位不匹配", `<div class="card warning"><h2>点位不匹配</h2><p>你选择的是${escapeHtml(POINTS[expected].short)}，请扫描该点位现场的二维码，不能使用其他点位的码。</p></div>`, 400, env);
+  }
+  if (qr.point === "start") return startScanPage(request, env);
+  return checkpointScanPage(request, env, qr.point, qr);
+}
+
+async function participantHome(request, env) {
+  const participant = await getParticipantFromCookie(request, env);
+  if (!participant) return htmlPage("请先签到", `<div class="card warning"><h2>请先扫描起点二维码签到</h2><p>请使用签到时的同一浏览器，不要清除浏览器数据。未识别到身份时，请联系起点工作人员。</p></div>`, 401, env);
+  const progress = await getProgress(env, participant.id);
+  if (participant.checkout_at) return participantDonePage(participant, progress, env);
+  return participantHubPage(participant, progress, env);
+}
+
+function participantHubPage(participant, progress, env, headers = {}) {
+  return htmlPage("我的点位", `
+    <div class="hero"><div class="badge">已签到 · ${escapeHtml(env.EVENT_TITLE || "健步走")}</div><h1>${escapeHtml(participant.name)}，出发吧</h1><p>到达现场后，点击对应点位打开摄像头，扫描现场动态二维码并完成答题。</p></div>
+    <div class="card muted"><p>手机号：${escapeHtml(participant.phone || "")}<br>部门：${escapeHtml(participant.department)}</p><p>无需退出页面。请一直使用签到时的同一浏览器。</p></div>
+    <h2>我的点位 · ${progress.doneCount} / 3</h2>
+    <div class="checkpoint-grid">
+      ${CHECKPOINTS.map((point, i) => {
+        const done = progress.done.get(point);
+        return `<section class="card checkpoint-card ${done ? "is-done" : ""}">
+          <div><div class="checkpoint-number">CHECKPOINT 0${i + 1}</div><h2>${escapeHtml(POINTS[point].short)}</h2><p>${done ? `已完成 · ${fmt(done.answered_at)}` : "到达本点位后扫描现场二维码，提交答案后完成打点。"}</p></div>
+          <button type="button" class="primary" data-scan-point="${point}" ${done ? "disabled" : ""}>${done ? "已完成，请勿重复打点" : `扫描${escapeHtml(POINTS[point].short)}二维码`}</button>
+        </section>`;
+      }).join("")}
+    </div>
+    <div class="card ${progress.doneCount ? "success-card" : "muted"}"><h2>${progress.doneCount ? "已满足签退条件" : "完成任意一个点位即可签退"}</h2><p>${progress.doneCount ? "请回到起点，扫描起点现场的动态二维码，再确认签退。" : "点击卡片只打开摄像头，不会直接生成打点记录。"}</p>
+      ${progress.doneCount ? '<button type="button" class="success" data-scan-point="start">扫描起点二维码，办理签退</button>' : ""}
+    </div>
+    <p><a href="/clear-session">不是本人？清除本机签到信息</a></p>
+    <div id="scan-panel" class="scan-panel" role="dialog" aria-modal="true" aria-labelledby="scan-title" hidden>
+      <div class="scan-content"><h2 id="scan-title">扫描现场二维码</h2><video id="scan-video" autoplay muted playsinline></video><canvas id="scan-canvas" hidden></canvas>
+      <p id="scan-status" class="scan-status" role="status" aria-live="polite"></p>
+      <button id="scan-retry" type="button" class="primary" hidden>重新开启摄像头</button>
+      <button id="scan-close" type="button" class="secondary">取消扫码，返回点位</button>
+      <p class="small">请允许摄像头权限。不支持扫码时，请使用支持摄像头的浏览器，并在同一浏览器完成签到和打点。</p></div>
+    </div>
+    <form id="scan-form" method="post" action="/scan/verify" hidden><input name="expected_point"><input name="token"></form>
+    <noscript><div class="card warning">请启用浏览器 JavaScript 后扫码。</div></noscript>
+    <script src="/assets/jsQR.js" defer></script><script src="/assets/scanner.js" defer></script>
+  `, 200, env, headers);
 }
 
 async function startScanPage(request, env) {
@@ -114,13 +182,7 @@ async function startScanPage(request, env) {
     return participantDonePage(participant, progress, env);
   }
 
-  if (progress.doneCount < 1) {
-    return htmlPage("已签到", `
-      <div class="hero"><div class="badge">${escapeHtml(title)}</div><h1>已完成起点签到</h1><p>${escapeHtml(participant.name)}，请至少完成任意一个点位的扫码打点和答题。</p></div>
-      ${progressCard(progress)}
-      <div class="card muted"><p>完成任意一个点位后，即可回到起点扫码签退。</p><p><a href="/clear-session">不是本人？清除本机签到信息</a></p></div>
-    `, 200, env);
-  }
+  if (progress.doneCount < 1) return participantHubPage(participant, progress, env);
 
   const checkoutToken = await signToken({ kind: "checkout", pid: participant.id, exp: unixNow() + actionTtl(env), nonce: crypto.randomUUID() }, secret(env));
   return htmlPage("起点签退", `
@@ -133,7 +195,7 @@ async function startScanPage(request, env) {
   `, 200, env);
 }
 
-async function checkpointScanPage(request, env, point) {
+async function checkpointScanPage(request, env, point, qr) {
   const participant = await getParticipantFromCookie(request, env);
   if (!participant) {
     return htmlPage("请先签到", `
@@ -166,9 +228,9 @@ async function checkpointScanPage(request, env, point) {
     return htmlPage("题库为空", `<div class="card danger"><h2>题库为空</h2><p>该点位没有可用题目，请联系工作人员在后台添加题目。</p></div>`, 200, env);
   }
 
-  const answerToken = await signToken({ kind: "answer", pid: participant.id, point, qid: question.id, exp: unixNow() + actionTtl(env), nonce: crypto.randomUUID() }, secret(env));
+  const answerToken = await signToken({ kind: "answer", v: 2, pid: participant.id, point, qid: question.id, scanned_at: unixNow(), qr_nonce: qr.nonce, exp: unixNow() + actionTtl(env), nonce: crypto.randomUUID() }, secret(env));
   return htmlPage(`${POINTS[point].short}答题`, `
-    <div class="hero"><div class="badge">${escapeHtml(POINTS[point].label)}</div><h1>扫码打点成功</h1><p>${escapeHtml(participant.name)}，请完成本点位随机题目。</p></div>
+    <div class="hero"><div class="badge">${escapeHtml(POINTS[point].label)}</div><h1>现场二维码验证通过</h1><p>${escapeHtml(participant.name)}，请在 ${Math.floor(actionTtl(env) / 60)} 分钟内提交本点位答案，提交后才算完成打点。</p></div>
     <form class="card quiz" method="post" action="/answer">
       <input type="hidden" name="answer_token" value="${escapeAttr(answerToken)}">
       <h2>${escapeHtml(question.title)}</h2>
@@ -260,18 +322,14 @@ async function checkinConfirmPost(request, env) {
   }
 
   const cookie = await participantCookie(participant.id, env, request);
-  return htmlPage("签到成功", `
-    <div class="hero"><div class="badge">签到成功</div><h1>${escapeHtml(participant.name)}，签到成功</h1><p>请按路线前往任意点位扫码打点并完成答题；完成任意一个点位后即可回起点签退。</p></div>
-    <div class="card muted"><p>手机号：${escapeHtml(participant.phone || "")}<br>部门：${escapeHtml(participant.department || "")}</p></div>
-    ${progressCard(await getProgress(env, participant.id))}
-  `, 200, env, { "Set-Cookie": cookie });
+  return participantHubPage(participant, await getProgress(env, participant.id), env, { "Set-Cookie": cookie });
 }
 
 async function answerPost(request, env) {
   const form = await request.formData();
   const answerToken = String(form.get("answer_token") || "");
   const payload = await verifyToken(answerToken, secret(env));
-  if (!payload || payload.kind !== "answer" || !CHECKPOINTS.includes(payload.point)) return expiredPage(env);
+  if (!payload || payload.kind !== "answer" || payload.v !== 2 || !payload.qr_nonce || !Number.isInteger(payload.scanned_at) || !CHECKPOINTS.includes(payload.point)) return expiredPage(env);
 
   const participant = await getParticipantFromCookie(request, env);
   if (!participant || participant.id !== payload.pid) {
@@ -290,15 +348,23 @@ async function answerPost(request, env) {
     return htmlPage("已完成该点位", `${progressCard(await getProgress(env, participant.id))}`, 200, env);
   }
 
-  const q = await env.DB.prepare("SELECT * FROM questions WHERE id = ? AND enabled = 1").bind(payload.qid).first();
+  const q = await env.DB.prepare("SELECT * FROM questions WHERE id = ? AND enabled = 1 AND (point_code = ? OR point_code = 'ALL')").bind(payload.qid, payload.point).first();
   if (!q) {
     return htmlPage("题目失效", `<div class="card danger"><h2>题目失效</h2><p>该题目已被删除或禁用，请重新扫描点位二维码。</p></div>`, 400, env);
   }
-  const isCorrect = selected === q.correct_option ? 1 : 0;
-  await env.DB.prepare(`
+  // One atomic statement: unique point record, active participant, live question.
+  // The pre-read above improves UX; this SQL is the actual concurrency guard.
+  const result = await env.DB.prepare(`
     INSERT INTO checkpoint_records (participant_id, point_code, question_id, question_title, selected_option, correct_option, is_correct, answered_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(participant.id, payload.point, q.id, q.title, selected, q.correct_option, isCorrect, nowIso()).run();
+    SELECT p.id, ?, q.id, q.title, ?, q.correct_option, CASE WHEN ? = q.correct_option THEN 1 ELSE 0 END, ?
+    FROM participants p, questions q
+    WHERE p.id = ? AND p.checkout_at IS NULL AND q.id = ? AND q.enabled = 1
+      AND (q.point_code = ? OR q.point_code = 'ALL')
+    ON CONFLICT(participant_id, point_code) DO NOTHING
+  `).bind(payload.point, selected, selected, nowIso(), participant.id, q.id, payload.point).run();
+  if (Number(result.meta?.changes) !== 1) {
+    return htmlPage("记录状态已变化", `<div class="card warning"><h2>本次未新增打点</h2><p>该点位可能已完成，或选手、题目状态发生变化。请返回我的点位查看最新记录。</p></div>`, 409, env);
+  }
 
   const progress = await getProgress(env, participant.id);
   const nextText = progress.doneCount >= 1 ? "已完成至少一个点位，已满足签退条件，请回到起点扫码签退。" : `还需完成任意一个点位。`;
@@ -349,13 +415,11 @@ function participantDonePage(participant, progress, env) {
 }
 
 async function adminLoginPage(env) {
-  const warn = !env.ADMIN_PASSWORD ? `<p class="small danger-text">当前未设置 ADMIN_PASSWORD Secret，临时默认密码为 admin123456。部署正式活动前务必修改。</p>` : "";
   return htmlPage("后台登录", `
     <div class="hero"><div class="badge">后台管理</div><h1>健步走后台登录</h1><p>登录后可查看动态二维码、选手记录和题库。</p></div>
     <form class="card" method="post" action="/admin/login">
       <label>后台密码<input type="password" name="password" required autocomplete="current-password" placeholder="请输入后台密码"></label>
       <button class="primary" type="submit">登录</button>
-      ${warn}
     </form>
   `, 200, env);
 }
@@ -363,7 +427,7 @@ async function adminLoginPage(env) {
 async function adminLoginPost(request, env) {
   const form = await request.formData();
   const password = String(form.get("password") || "");
-  const expected = env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
+  const expected = env.ADMIN_PASSWORD;
   if (password !== expected) {
     return htmlPage("登录失败", `<div class="card danger"><h2>密码错误</h2><p>请返回重新输入。</p></div>`, 403, env);
   }
@@ -454,43 +518,39 @@ async function adminParticipantDelete(request, env) {
   const f = await request.formData();
   const id = cleanText(f.get("id"), 80);
   if (!id) return redirect("/admin");
-  await env.DB.prepare("DELETE FROM checkpoint_records WHERE participant_id = ?").bind(id).run();
-  await env.DB.prepare("DELETE FROM participants WHERE id = ?").bind(id).run();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM checkpoint_records WHERE participant_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM participants WHERE id = ?").bind(id)
+  ]);
   return redirect("/admin");
 }
 
 async function adminParticipantsClear(request, env) {
-  await env.DB.prepare("DELETE FROM checkpoint_records").run();
-  await env.DB.prepare("DELETE FROM participants").run();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM checkpoint_records"),
+    env.DB.prepare("DELETE FROM participants")
+  ]);
   return redirect("/admin");
 }
 
 async function adminQrList(request, env) {
-  const origin = new URL(request.url).origin;
-  const cards = Object.values(POINTS).map(p => {
-    const key = pointKey(env, p.code);
-    const staffUrl = key ? `${origin}/display/${p.code}?k=${encodeURIComponent(key)}` : "";
-    return `
+  const cards = Object.values(POINTS).map(p => `
     <div class="qr-mini-card">
       <h2>${escapeHtml(p.label)}</h2>
-      <p class="small">点位专属链接：${key ? "已配置" : "未配置，仅管理员可打开"}</p>
       <img class="live-qr" data-point="${p.code}" alt="${escapeAttr(p.label)}二维码">
-      <a class="button" href="/display/${p.code}" target="_blank">管理员打开大屏二维码</a>
-      ${staffUrl ? `<p class="small">发给工作人员的链接：</p><input readonly value="${escapeAttr(staffUrl)}" onclick="this.select()"><a class="button secondary" href="${escapeAttr(staffUrl)}" target="_blank">打开专属链接</a>` : `<p class="small danger-text">请先设置 ${escapeHtml(pointKeyEnvName(p.code))}</p>`}
+      <a class="button" href="/display/${p.code}" target="_blank">打开大屏二维码</a>
     </div>
-  `;
-  }).join("");
+  `).join("");
   return htmlPage("动态二维码", `
     ${adminNav("qrs")}
-    <div class="card muted"><p>二维码短时有效，页面会自动刷新。请分别在起点、三个点位打开对应二维码页面；选手完成任意一个点位即可回起点签退。</p><p>为防止非本点位人员打开二维码，可在 Cloudflare Pages 环境变量中分别设置 QR_KEY_START、QR_KEY_CP1、QR_KEY_CP2、QR_KEY_CP3，然后把后台生成的专属链接发给对应点位工作人员。</p></div>
+    <div class="card muted"><p>二维码短时有效，页面会自动刷新。请分别在起点、三个点位打开对应二维码页面；选手完成任意一个点位即可回起点签退。</p></div>
     <div class="qr-grid">${cards}</div>
-    <script>${clientQrRefreshScript()}</script>
+    <script src="/assets/qr-display.js" data-ttl="${qrTtl(env)}" defer></script>
   `, 200, env);
 }
 
-async function displayQrPage(request, env, point) {
-  if (!POINTS[point]) return htmlPage("点位不存在", `<div class="card warning"><h2>点位不存在</h2></div>`, 404, env);
-  if (!(await canViewQr(request, env, point))) return displayKeyDeniedPage(env, point);
+function displayQrPage(request, env, point) {
+  if (!Object.hasOwn(POINTS, point)) return htmlPage("点位不存在", `<div class="card warning"><h2>点位不存在</h2></div>`, 404, env);
   return htmlPage(POINTS[point].label, `
     <main class="display-page">
       <div class="display-title">${escapeHtml(env.EVENT_TITLE || "健步走签到打点系统")}</div>
@@ -499,67 +559,27 @@ async function displayQrPage(request, env, point) {
       <p id="countdown">二维码自动刷新中</p>
       <p class="small">请使用本人手机扫码。二维码过期后请重新扫描现场最新二维码。</p>
     </main>
-    <script>${clientQrRefreshScript()}</script>
+    <script src="/assets/qr-display.js" data-ttl="${qrTtl(env)}" defer></script>
   `, 200, env, {}, true);
-}
-
-function displayKeyDeniedPage(env, point) {
-  const envName = pointKeyEnvName(point);
-  return htmlPage("无权打开二维码", `
-    <div class="card warning"><h2>无权打开该点位二维码</h2><p>${escapeHtml(POINTS[point].label)} 需要使用点位专属链接打开。</p><p class="small">请确认链接中包含正确的 <code>k=</code> 密钥；如未配置，请在 Cloudflare Pages 环境变量中设置 ${escapeHtml(envName)}。</p></div>
-  `, 403, env);
 }
 
 async function apiQrSvg(request, env) {
   const url = new URL(request.url);
   const point = url.searchParams.get("point") || "";
-  if (!POINTS[point]) return new Response("Bad point", { status: 400 });
-  const ttl = qrTtl(env);
-  const token = await signToken({ kind: "qr", point, exp: unixNow() + ttl, nonce: crypto.randomUUID() }, secret(env));
+  if (!Object.hasOwn(POINTS, point)) return new Response("Bad point", { status: 400 });
+  const iat = unixNow();
+  const exp = iat + qrTtl(env);
+  const token = await signToken({ kind: "qr", v: 2, point, iat, exp, nonce: crypto.randomUUID() }, secret(env));
   const scanUrl = `${url.origin}/scan?token=${encodeURIComponent(token)}`;
-
-  // Cloudflare Pages Functions 的构建环境有时不会安装 npm 依赖。
-  // 为了让项目在 Pages 上更稳，二维码图片由在线二维码接口生成，
-  // 本系统只负责生成短时有效、带签名的扫码链接。
-  const qrApi = "https://api.qrserver.com/v1/create-qr-code/?" + new URLSearchParams({
-    size: "560x560",
-    format: "svg",
-    margin: "1",
-    data: scanUrl
-  }).toString();
-
-  const qrResp = await fetch(qrApi, {
-    headers: { "User-Agent": "walk-qr-cloudflare-pages/1.0" }
-  });
-
-  if (!qrResp.ok) {
-    return new Response(fallbackQrSvg(scanUrl), {
-      headers: {
-        "Content-Type": "image/svg+xml; charset=utf-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
-      }
-    });
-  }
-
-  return new Response(qrResp.body, {
+  // Render inside the Function; signed links never go to a third-party QR service.
+  return new Response(await renderQrSvg(scanUrl), {
     headers: {
-      "Content-Type": qrResp.headers.get("Content-Type") || "image/svg+xml; charset=utf-8",
-      "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+      "Content-Type": "image/svg+xml; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-QR-Expires": String(exp),
+      "X-QR-Server-Time": String(iat)
     }
   });
-}
-
-function fallbackQrSvg(scanUrl) {
-  const safeUrl = escapeHtml(scanUrl);
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="560" height="560" viewBox="0 0 560 560">
-    <rect width="560" height="560" fill="#fff"/>
-    <rect x="24" y="24" width="512" height="512" fill="none" stroke="#111827" stroke-width="8"/>
-    <text x="280" y="235" text-anchor="middle" font-size="28" font-family="Arial, sans-serif" fill="#111827">二维码生成失败</text>
-    <text x="280" y="275" text-anchor="middle" font-size="18" font-family="Arial, sans-serif" fill="#374151">请刷新页面，或复制下方链接打开</text>
-    <foreignObject x="45" y="310" width="470" height="160">
-      <div xmlns="http://www.w3.org/1999/xhtml" style="font:16px Arial,sans-serif;word-break:break-all;color:#111827;text-align:center;line-height:1.45;">${safeUrl}</div>
-    </foreignObject>
-  </svg>`;
 }
 
 async function adminQuestions(request, env) {
@@ -713,32 +733,6 @@ function adminNav(active = "") {
   </nav>`;
 }
 
-function clientQrRefreshScript() {
-  return `
-    const intervalMs = 20000;
-    const displayKey = new URLSearchParams(location.search).get('k') || '';
-    function refreshQrs(){
-      document.querySelectorAll('.live-qr').forEach(img => {
-        const p = img.dataset.point;
-        const keyPart = displayKey ? '&k=' + encodeURIComponent(displayKey) : '';
-        img.src = '/api/qrcode.svg?point=' + encodeURIComponent(p) + keyPart + '&_=' + Date.now();
-      });
-      const cd = document.getElementById('countdown');
-      if (cd) cd.textContent = '二维码已刷新：' + new Date().toLocaleTimeString();
-    }
-    refreshQrs();
-    setInterval(refreshQrs, intervalMs);
-  `;
-}
-
-async function canViewQr(request, env, point) {
-  if (!POINTS[point]) return false;
-  if (await isAdmin(request, env)) return true;
-  const url = new URL(request.url);
-  const k = url.searchParams.get("k") || "";
-  const expected = pointKey(env, point);
-  return !!expected && k === expected;
-}
 
 async function clearParticipantSession(request, env) {
   return htmlPage("已清除", `<div class="card success-card"><h2>已清除本机签到信息</h2><p>现在可重新扫描起点二维码进行签到。</p></div>`, 200, env, {
@@ -783,28 +777,18 @@ function parseCookies(header) {
 }
 
 function secret(env) {
-  return env.QR_SECRET || DEFAULT_QR_SECRET;
+  return env.QR_SECRET;
 }
 function adminSecret(env) {
-  return `${secret(env)}:${env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD}`;
-}
-function pointKeyEnvName(point) {
-  return { start: "QR_KEY_START", cp1: "QR_KEY_CP1", cp2: "QR_KEY_CP2", cp3: "QR_KEY_CP3" }[point] || "";
-}
-function pointKey(env, point) {
-  const name = pointKeyEnvName(point);
-  return name ? String(env[name] || "") : "";
-}
-function pointKeyConfigured(env, point) {
-  return pointKey(env, point).length > 0;
+  return `${secret(env)}:${env.ADMIN_PASSWORD}`;
 }
 function qrTtl(env) {
   const n = Number(env.QR_TOKEN_TTL_SECONDS || 45);
-  return Number.isFinite(n) && n >= 15 ? n : 45;
+  return Number.isInteger(n) && n >= 15 && n <= 120 ? n : 45;
 }
 function actionTtl(env) {
   const n = Number(env.ACTION_TOKEN_TTL_SECONDS || 600);
-  return Number.isFinite(n) && n >= 120 ? n : 600;
+  return Number.isInteger(n) && n >= 120 && n <= 900 ? n : 600;
 }
 function unixNow() { return Math.floor(Date.now() / 1000); }
 function nowIso() { return new Date().toISOString(); }
@@ -816,17 +800,26 @@ async function signToken(payload, key) {
 }
 
 async function verifyToken(token, key) {
-  const [body, sig] = String(token || "").split(".");
-  if (!body || !sig) return null;
-  const expected = await hmac(body, key);
-  if (sig !== expected) return null;
+  if (typeof token !== "string" || token.length > 4096) return null;
+  const parts = token.split(".");
+  if (parts.length !== 2 || !parts.every(p => /^[A-Za-z0-9_-]+$/.test(p))) return null;
+  const [body, sig] = parts;
   try {
+    const cryptoKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+    if (!(await crypto.subtle.verify("HMAC", cryptoKey, base64urlDecode(sig), new TextEncoder().encode(body)))) return null;
     const payload = JSON.parse(new TextDecoder().decode(base64urlDecode(body)));
-    if (payload.exp && Number(payload.exp) < unixNow()) return null;
+    if (!payload || !Number.isInteger(payload.exp) || payload.exp <= unixNow()) return null;
     return payload;
-  } catch (_) {
-    return null;
-  }
+  } catch (_) { return null; }
+}
+
+async function verifyQrToken(token, env) {
+  const qr = await verifyToken(token, secret(env));
+  if (!qr || qr.kind !== "qr" || qr.v !== 2 || !Object.hasOwn(POINTS, qr.point) ||
+      !Number.isInteger(qr.iat) || qr.iat > unixNow() ||
+      qr.exp <= qr.iat || qr.exp - qr.iat > 120 ||
+      typeof qr.nonce !== "string" || qr.nonce.length < 16) return null;
+  return qr;
 }
 
 async function hmac(data, key) {
@@ -851,11 +844,12 @@ function base64urlDecode(s) {
 
 function htmlPage(title, body, status = 200, env = {}, headers = {}, displayMode = false) {
   const fullTitle = `${title} - ${env.EVENT_TITLE || "健步走签到打点系统"}`;
-  return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${escapeHtml(fullTitle)}</title><style>${styles()}</style></head><body class="${displayMode ? "display-body" : ""}"><div class="app">${body}</div></body></html>`, {
+  return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${escapeHtml(fullTitle)}</title><style>${styles()}</style></head><body class="${displayMode ? "display-body" : ""}"><div class="app">${body}${!displayMode && !["后台登录", "后台管理", "动态二维码", "题库管理", "选手详情"].includes(title) ? '<p class="home-link"><a href="/me">返回我的点位</a></p>' : ""}</div></body></html>`, {
     status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
       ...headers
     }
   });
@@ -891,6 +885,7 @@ function escapeAttr(s) { return escapeHtml(s); }
 
 function styles() {
   return `
+    [hidden]{display:none!important}.checkpoint-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.checkpoint-card{margin:0;display:flex;flex-direction:column;justify-content:space-between}.checkpoint-card p{color:var(--muted);line-height:1.65}.checkpoint-number{font-size:13px;font-weight:800;letter-spacing:2px;color:var(--brand)}.checkpoint-card .primary{margin-top:6px}.checkpoint-card.is-done{border-color:#86efac;background:#f0fdf4}button:disabled{opacity:.55;cursor:default}.scan-panel{position:fixed;inset:0;z-index:1000;background:rgba(15,23,42,.97);color:white;overflow:auto;padding:20px}.scan-content{max-width:640px;margin:auto}.scan-panel video{display:block;width:100%;max-height:58vh;background:#000;border-radius:18px;object-fit:contain}.scan-panel p{line-height:1.6}.home-link{text-align:center;margin:24px}.scan-status{min-height:52px}.qr-mini-card img[hidden],.display-qr[hidden]{display:none!important}@media(max-width:720px){.checkpoint-grid{grid-template-columns:1fr}.checkpoint-card{padding:18px}}
     :root{--bg:#f4f7fb;--card:#fff;--text:#172033;--muted:#667085;--line:#e6eaf0;--brand:#2563eb;--ok:#10b981;--warn:#f59e0b;--danger:#ef4444;--shadow:0 10px 30px rgba(16,24,40,.08)}
     *{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#eef4ff 0%,var(--bg) 320px);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif}a{color:var(--brand);text-decoration:none}.app{width:min(1080px,100%);margin:0 auto;padding:20px}.hero{padding:28px 18px 14px}.hero h1{font-size:34px;line-height:1.15;margin:10px 0}.hero p{font-size:17px;color:var(--muted);line-height:1.65;margin:0}.badge{display:inline-block;padding:6px 12px;border-radius:999px;background:#e0ecff;color:#174ea6;font-weight:700;font-size:13px}.card{background:var(--card);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow);padding:20px;margin:16px 0}.card h2{margin:0 0 14px;font-size:22px}.muted{color:var(--muted)}.warning{border-color:#fde68a;background:#fffbeb}.danger{border-color:#fecaca;background:#fff1f2}.success-card{border-color:#bbf7d0;background:#f0fdf4}.danger-text{color:var(--danger)}.small{font-size:13px;color:var(--muted)}label{display:block;font-weight:700;margin:14px 0 8px}input,select{width:100%;padding:13px 14px;border:1px solid #cfd8e3;border-radius:14px;font:inherit;background:#fff}button,.button{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:14px;padding:12px 18px;font-weight:800;font-size:16px;cursor:pointer}.primary{background:var(--brand);color:#fff;width:100%;margin-top:16px}.success{background:var(--ok);color:#fff;width:100%;margin-top:16px}.secondary{background:#eef2f7;color:#344054;width:100%;margin-top:10px}.danger-button{background:var(--danger);color:#fff}.linkbtn{background:none;color:var(--danger);padding:4px}.table-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.table-actions form{margin:0}.confirm-row{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding:12px 0}.confirm-row:last-child{border-bottom:0}.confirm-row span{color:var(--muted)}.confirm-row b{text-align:right}.option{display:flex;gap:12px;align-items:flex-start;border:1px solid var(--line);border-radius:16px;padding:14px;margin:12px 0;font-weight:500}.option input{width:auto;margin-top:4px}.progress-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.progress-item{border:1px solid var(--line);border-radius:16px;padding:16px;text-align:center}.progress-item b{display:block;font-size:18px}.progress-item span{color:var(--muted);font-size:14px}.progress-item.done{border-color:#86efac;background:#f0fdf4}.progress-item.todo{background:#f8fafc}.admin-nav{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 20px}.admin-nav a{padding:10px 14px;border-radius:999px;background:#fff;border:1px solid var(--line);font-weight:800}.admin-nav a.active{background:var(--brand);color:#fff;border-color:var(--brand)}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.stats div{background:#fff;border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:var(--shadow)}.stats b{font-size:34px;display:block}.stats span{color:var(--muted)}.table-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{border-bottom:1px solid var(--line);padding:12px;text-align:left;vertical-align:top}th{background:#f8fafc;color:#475467}.pill{display:inline-block;border-radius:999px;padding:4px 9px;font-weight:800;font-size:12px}.pill.ok{background:#dcfce7;color:#166534}.pill.no{background:#f1f5f9;color:#475569}.pill.doing{background:#fef3c7;color:#92400e}.empty{text-align:center;color:var(--muted);padding:30px}.qr-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.qr-mini-card{background:#fff;border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow);padding:18px;text-align:center}.qr-mini-card img{width:min(320px,100%);height:auto;background:#fff}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}.display-body{background:#0f172a;color:#fff}.display-body .app{width:100%;min-height:100vh;display:flex;align-items:center;justify-content:center}.display-page{text-align:center;padding:30px}.display-title{font-size:28px;font-weight:900;opacity:.85}.display-page h1{font-size:64px;margin:22px 0}.display-qr{width:min(72vh,680px);max-width:92vw;border:18px solid #fff;border-radius:28px;background:#fff;box-shadow:0 20px 60px rgba(0,0,0,.35)}.display-page p{font-size:22px;opacity:.85}.success-hero{background:linear-gradient(135deg,#ecfdf5,#eff6ff);border-radius:24px;margin-top:10px}@media(max-width:720px){.app{padding:12px}.hero h1{font-size:28px}.progress-row,.stats,.qr-grid,.grid2{grid-template-columns:1fr}.display-page h1{font-size:38px}.display-title{font-size:20px}.display-page p{font-size:16px}}
   `;

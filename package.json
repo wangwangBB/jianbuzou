@@ -1,14 +1,20 @@
 {
   "name": "walk-qr-cloudflare-pages",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "健步走签到、打点、答题、签退系统，Cloudflare Pages + Pages Functions + D1 版本（无 npm 二维码依赖版）",
+  "description": "健步走：独立点位摄像头扫码、短时签名验证、Cloudflare Pages + D1",
   "scripts": {
-    "deploy": "wrangler pages deploy public --project-name walk-qr-cloudflare-pages",
-    "dev": "wrangler pages dev public --compatibility-date=2025-01-01"
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:qr": "node --test tests/qr.integration.mjs",
+    "deploy": "npm run build && wrangler pages deploy public --project-name walk-qr-cloudflare-pages",
+    "dev": "npm run build && wrangler pages dev public --compatibility-date=2025-01-01"
   },
-  "dependencies": {},
+  "dependencies": {
+    "jsqr": "1.4.0",
+    "qrcode-generator": "1.4.4"
+  },
   "devDependencies": {
     "wrangler": "^4.20.0"
   }
