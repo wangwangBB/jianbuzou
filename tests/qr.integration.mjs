@@ -38,3 +38,17 @@ test("authenticated QR endpoint generates SVG with expiry and strict no-cache he
     assert.match(await result.text(), /<svg/);
   }
 });
+
+test('shared staff link generates only its point QR and stops after revoke', async () => {
+  const f=fixture();
+  await f.call('/admin/qrs/share',{cookie:f.adminCookie,form:{point:'cp1',action:'create',days:1}});
+  const html=await (await f.call('/admin/qrs',{cookie:f.adminCookie})).text();
+  const url=new URL(html.match(/id="share-url-cp1" readonly value="([^"]+)"/)[1].replaceAll('&amp;','&'));
+  const query='?point=cp1&share='+url.searchParams.get('share');
+  const response=await f.call('/api/qrcode.svg'+query);
+  assert.equal(response.status,200);
+  assert.match(await response.text(),/<svg/);
+  assert.equal(Number(response.headers.get('X-QR-Expires'))-Number(response.headers.get('X-QR-Server-Time')),45);
+  await f.call('/admin/qrs/share',{cookie:f.adminCookie,form:{point:'cp1',action:'revoke'}});
+  assert.equal((await f.call('/api/qrcode.svg'+query)).status,401);
+});
