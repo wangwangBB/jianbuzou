@@ -46,3 +46,11 @@ CREATE INDEX IF NOT EXISTS idx_participants_checkin_at ON participants(checkin_a
 CREATE INDEX IF NOT EXISTS idx_records_participant ON checkpoint_records(participant_id);
 CREATE INDEX IF NOT EXISTS idx_records_point ON checkpoint_records(point_code);
 CREATE INDEX IF NOT EXISTS idx_questions_enabled_point ON questions(enabled, point_code);
+
+
+-- Staff display links; created automatically on first admin sharing use.
+CREATE TABLE IF NOT EXISTS qr_staff_shares (
+  point_code TEXT PRIMARY KEY CHECK(point_code IN ('start','cp1','cp2','cp3')),
+  share_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);

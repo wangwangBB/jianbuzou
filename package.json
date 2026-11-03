@@ -1,6 +1,6 @@
 {
   "name": "walk-qr-cloudflare-pages",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "健步走：独立点位摄像头扫码、短时签名验证、Cloudflare Pages + D1",

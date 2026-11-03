@@ -66,15 +66,23 @@ async function router(request, env) {
   if (path === "/admin/login" && request.method === "POST") return adminLoginPost(request, env);
   if (path === "/admin/logout") return adminLogout(request, env);
 
-  if (path.startsWith("/admin") || path.startsWith("/display") || path === "/api/qrcode.svg") {
+  if (path.startsWith("/admin")) {
     if (!(await isAdmin(request, env))) {
-      if (path === "/api/qrcode.svg") return new Response("Unauthorized", { status: 401 });
       return redirect(`/admin/login?next=${encodeURIComponent(path + url.search)}`);
+    }
+  }
+  if (path.startsWith("/display/") || path === "/api/qrcode.svg") {
+    const point = path === "/api/qrcode.svg" ? url.searchParams.get("point") : path.split("/")[2];
+    if (!(await canViewPointQr(request, env, point))) {
+      if (path === "/api/qrcode.svg") return new Response("Unauthorized", { status: 401 });
+      if (url.searchParams.has("share")) return htmlPage("分享链接不可用", `<div class="card warning"><h2>分享链接已过期、停用或不属于此点位</h2><p>请联系管理员获取本点位新的工作人员链接，无需提供管理员密码。</p></div>`, 403, env);
+      return redirect(`/admin/login?next=${encodeURIComponent(path)}`);
     }
   }
 
   if (path === "/admin" && request.method === "GET") return adminDashboard(request, env);
   if (path === "/admin/qrs" && request.method === "GET") return adminQrList(request, env);
+  if (path === "/admin/qrs/share" && request.method === "POST") return adminSharePost(request, env);
   if (path.startsWith("/display/") && request.method === "GET") return displayQrPage(request, env, path.split("/")[2]);
   if (path === "/api/qrcode.svg" && request.method === "GET") return apiQrSvg(request, env);
   if (path === "/admin/questions" && request.method === "GET") return adminQuestions(request, env);
@@ -533,19 +541,79 @@ async function adminParticipantsClear(request, env) {
   return redirect("/admin");
 }
 
+// Additive migration: preserves every participant, question and checkpoint record.
+async function ensureQrShares(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS qr_staff_shares (
+    point_code TEXT PRIMARY KEY CHECK(point_code IN ('start','cp1','cp2','cp3')),
+    share_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )`).run();
+}
+
+async function canViewPointQr(request, env, point) {
+  if (await isAdmin(request, env)) return true;
+  if (!Object.hasOwn(POINTS, point)) return false;
+  const token = new URL(request.url).searchParams.get("share") || "";
+  const payload = await verifyToken(token, secret(env));
+  if (!payload || payload.kind !== "staff_qr" || payload.point !== point || typeof payload.sid !== "string") return false;
+  await ensureQrShares(env);
+  const active = await env.DB.prepare("SELECT share_id, expires_at FROM qr_staff_shares WHERE point_code = ?").bind(point).first();
+  return !!active && active.share_id === payload.sid && active.expires_at === payload.exp && active.expires_at > unixNow();
+}
+
+async function adminSharePost(request, env) {
+  const form = await request.formData();
+  const point = String(form.get("point") || "");
+  const action = String(form.get("action") || "");
+  if (!Object.hasOwn(POINTS, point) || !["create", "revoke"].includes(action)) return new Response("Bad request", { status: 400 });
+  await ensureQrShares(env);
+  if (action === "revoke") {
+    await env.DB.prepare("DELETE FROM qr_staff_shares WHERE point_code = ?").bind(point).run();
+  } else {
+    const days = Number(form.get("days"));
+    if (![1, 7, 30].includes(days)) return new Response("Bad expiry", { status: 400 });
+    await env.DB.prepare(`INSERT INTO qr_staff_shares(point_code, share_id, expires_at) VALUES (?, ?, ?)
+      ON CONFLICT(point_code) DO UPDATE SET share_id=excluded.share_id, expires_at=excluded.expires_at`)
+      .bind(point, crypto.randomUUID(), unixNow() + days * 86400).run();
+  }
+  return redirect(`/admin/qrs#share-${point}`);
+}
+
 async function adminQrList(request, env) {
-  const cards = Object.values(POINTS).map(p => `
-    <div class="qr-mini-card">
+  await ensureQrShares(env);
+  const rows = await env.DB.prepare("SELECT * FROM qr_staff_shares").all();
+  const active = new Map((rows.results || []).filter(r => r.expires_at > unixNow()).map(r => [r.point_code, r]));
+  const cards = await Promise.all(Object.values(POINTS).map(async p => {
+    const grant = active.get(p.code);
+    const shareToken = grant ? await signToken({ kind: "staff_qr", point: p.code, sid: grant.share_id, exp: grant.expires_at }, secret(env)) : "";
+    const shareUrl = grant ? `${new URL(request.url).origin}/display/${p.code}?share=${encodeURIComponent(shareToken)}` : "";
+    return `<div class="qr-mini-card" id="share-${p.code}">
       <h2>${escapeHtml(p.label)}</h2>
       <img class="live-qr" data-point="${p.code}" alt="${escapeAttr(p.label)}二维码">
-      <a class="button" href="/display/${p.code}" target="_blank">打开大屏二维码</a>
-    </div>
-  `).join("");
+      <a class="button" href="/display/${p.code}" target="_blank" rel="noopener">打开大屏二维码</a>
+      <div class="card" style="text-align:left"><h3>分享给本点位工作人员</h3>
+        <p class="small">分享链接可免密展示本点位的动态码，不可访问后台或其他点位。请勿发给选手或公开群。</p>
+        ${grant ? `<label>工作人员专用链接<input id="share-url-${p.code}" readonly value="${escapeAttr(shareUrl)}"></label>
+          <p class="small">有效至：${fmt(new Date(grant.expires_at * 1000).toISOString())}</p>
+          <button type="button" class="secondary" data-copy-share="share-url-${p.code}">复制工作人员链接</button>
+          <a class="button" href="${escapeAttr(shareUrl)}" target="_blank" rel="noopener">预览工作人员页面</a>
+          <form method="post" action="/admin/qrs/share" onsubmit="return confirm('停用后，工作人员需重新领取链接，确定停用吗？')">
+            <input type="hidden" name="point" value="${p.code}"><input type="hidden" name="action" value="revoke">
+            <button type="submit" class="linkbtn">停用分享链接</button></form>` : '<p class="small">尚无有效分享链接。</p>'}
+        <form method="post" action="/admin/qrs/share" ${grant ? `onsubmit="return confirm('重新生成会停用原链接，确定继续吗？')"` : ""}>
+          <input type="hidden" name="point" value="${p.code}"><input type="hidden" name="action" value="create">
+          <label>分享有效期<select name="days"><option value="1">1 天</option><option value="7" selected>7 天</option><option value="30">30 天</option></select></label>
+          <button class="primary" type="submit">${grant ? "重新生成分享链接" : "生成工作人员分享链接"}</button>
+        </form>
+      </div>
+    </div>`;
+  }));
   return htmlPage("动态二维码", `
     ${adminNav("qrs")}
-    <div class="card muted"><p>二维码短时有效，页面会自动刷新。请分别在起点、三个点位打开对应二维码页面；选手完成任意一个点位即可回起点签退。</p></div>
-    <div class="qr-grid">${cards}</div>
+    <div class="card muted"><p>四个位置分别分享给对应工作人员。工作人员打开链接即可持续展示动态二维码，无需管理员密码。选手仍须扫描现场短时动态码。</p><p>停用或重新生成后，旧链接不能继续取码；此前已显示的短时码到期后失效。</p></div>
+    <div class="qr-grid">${cards.join("")}</div>
     <script src="/assets/qr-display.js" data-ttl="${qrTtl(env)}" defer></script>
+    <script src="/assets/share-links.js" defer></script>
   `, 200, env);
 }
 
